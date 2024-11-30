@@ -1,0 +1,6 @@
+deepgram-sdk
+webrtcvad
+gtts
+numpy
+openai==1.35.14
+plvio
