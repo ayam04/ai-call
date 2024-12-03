@@ -6,3 +6,4 @@ deepgram-sdk==3.7.7
 numpy==1.24.2
 wave
 openai==0.27.4
+ngrok
