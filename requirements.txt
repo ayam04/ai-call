@@ -1,6 +1,8 @@
-deepgram-sdk
-webrtcvad
-gtts
-numpy
-openai==1.35.14
-plvio
+plivo==4.58.0
+asyncio==3.4.3
+webrtcvad==2.0.10
+websockets==12.0
+deepgram-sdk==3.7.7
+numpy==1.24.2
+wave
+openai==0.27.4

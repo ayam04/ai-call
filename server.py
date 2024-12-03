@@ -2,217 +2,230 @@ import asyncio
 import base64
 import json
 import sys
+import traceback
+import io
+import wave
+
+import numpy as np
 import webrtcvad
 import websockets
-from deepgram import Deepgram
-import io
-import traceback
-import numpy as np
-import wave
-from openai import OpenAI
-import os
-from datetime import datetime
+import openai
 
-from gtts import gTTS
+from deepgram import (
+    DeepgramClient,
+    DeepgramClientOptions,
+    SpeakOptions,
+    PrerecordedOptions
+)
 
-with open("config.json", 'r') as f:
-    CONFIG = json.load(f)
-
-dg_client = Deepgram(CONFIG['deepgram_api_key'])
-openai_client = OpenAI(api_key=CONFIG['openai_api_key'])
-
-def generate_interview_questions():
-    messages = [
-        {
-            "role": "system", 
-            "content": "You are an expert technical interviewer for data science positions. Generate 2 challenging and thoughtful interview questions that test both technical knowledge and problem-solving skills in data science."
-        },
-        {
-            "role": "user", 
-            "content": "Please generate 2 in-depth data science interview questions that assess a candidate's understanding of advanced concepts, analytical thinking, and practical application of data science principles."
-        }
-    ]
-    
+def load_config(file_path='config.json'):
+    """Load configuration from a JSON file."""
     try:
-        response = openai_client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=messages,
-            max_tokens=300,
-            temperature=0.7
-        )
-        
-        questions_text = response.choices[0].message.content.strip()
-        questions = [q.strip() for q in questions_text.split('\n') if q.strip()]
-        
-        return questions[:2] if len(questions) >= 2 else [
-            "Can you explain a complex machine learning concept you've worked with?",
-            "Describe a challenging data preprocessing problem you've solved."
-        ]
-    
-    except Exception as e:
-        print(f"Error generating questions: {e}")
-        return [
-            "Can you explain a complex machine learning concept you've worked with?",
-            "Describe a challenging data preprocessing problem you've solved."
-        ]
+        with open(file_path, 'r') as f:
+            return json.load(f)
+    except FileNotFoundError:
+        print(f"Config file {file_path} not found.")
+        sys.exit(1)
+    except json.JSONDecodeError:
+        print(f"Error decoding JSON from {file_path}")
+        sys.exit(1)
 
-class InterviewState:
-    def __init__(self):
-        self.stage = 'greeting'
-        self.questions = generate_interview_questions()
-        self.current_question_index = -1
-        self.answers = []
-        self.interview_started = False
-        self.interview_completed = False
+# Load configuration
+CONFIG = load_config()
 
-interview_state = InterviewState()
+# Initialize clients with error handling
+try:
+    dg_client = DeepgramClient(CONFIG['deepgram_api_key'])
+    dg_config = DeepgramClientOptions(api_key=CONFIG['deepgram_api_key'])
+except KeyError as e:
+    print(f"Missing configuration key: {e}")
+    sys.exit(1)
 
-async def transcribe_audio(audio_chunk, channels=1, sample_width=2, frame_rate=8000):
+# Set OpenAI API key
+try:
+    openai.api_key = CONFIG['openai_api_key']
+except KeyError:
+    print("OpenAI API key is missing from configuration")
+    sys.exit(1)
+
+# Interview system message
+SYSTEM_MSG = """You are an AI interviewer for HYRGPT, a platform designed to assist companies in screening and interviewing candidates. Your task is to conduct a structured telephonic interview with each candidate, which will take approximately 5 to 10 minutes to complete.
+
+Here's how you should proceed:
+
+1. Begin the interview by asking:
+   "Hello, this is Reva from Hire GPT. Do you have 10 minutes to complete the interview now?"
+
+2. Interview Questions:
+   - Please tell me more about your recent work experience.
+   - Can you describe your experience with developing mobile applications for both iOS and Android platforms?
+   - What are some best practices you follow when integrating APIs into mobile applications?
+   - How do you ensure that the mobile applications you develop are user-friendly and meet UI/UX design standards?
+   - What tools do you use for testing and optimization?
+   - Describe a situation where you faced a significant challenge during a mobile development project.
+   - Imagine you are working on a tight deadline for a mobile application launch. How would you prioritize tasks and manage your time effectively to meet the deadline?
+
+3. Interview Guidelines:
+   - Maintain a professional tone with warmth
+   - Acknowledge previous responses before asking next question
+   - If a candidate asks to skip a question, note "skipped by user"
+   - If a candidate asks to repeat a question, do so
+   - If a candidate wants to end the interview early, submit collected answers
+   - Do not provide hints for questions
+
+4. Closing: Thank the candidate and mention follow-up via email."""
+
+# Initialize messages with system context
+messages = [{"role": "system", "content": SYSTEM_MSG}]
+
+async def transcribe_audio(audio_chunk):
     try:
-        audio_data = np.frombuffer(audio_chunk, dtype=np.int16)
-        wav_io = io.BytesIO()
-
-        with wave.open(wav_io, 'wb') as wav_file:
-            wav_file.setnchannels(channels)
-            wav_file.setsampwidth(sample_width)
-            wav_file.setframerate(frame_rate)
+        audio_data = np.frombuffer(audio_chunk, dtype=np.uint8)
+        wav_buffer = io.BytesIO()
+        
+        with wave.open(wav_buffer, 'wb') as wav_file:
+            wav_file.setnchannels(1)
+            wav_file.setsampwidth(2)
+            wav_file.setframerate(8000)
             wav_file.writeframes(audio_data.tobytes())
-
-        wav_io.seek(0)
-
-        response = await dg_client.transcription.prerecorded({
-            'buffer': wav_io,
-            'mimetype': 'audio/wav'
-        }, {
-            'punctuate': True
-        })
-
-        transcription = response['results']['channels'][0]['alternatives'][0]['transcript']
-
-        if transcription != '':
-            print("Transcription: ", transcription)
-
-        return transcription
-    except Exception as e:
-        print("An error occurred during transcription:")
-        traceback.print_exc()
-
-def save_interview_results(questions, answers):
-    os.makedirs('interviews', exist_ok=True)
-    
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f'interviews/interview_{timestamp}.json'
-    
-    with open(filename, 'w') as f:
-        json.dump({
-            'timestamp': timestamp,
-            'questions': questions,
-            'answers': answers
-        }, f, indent=4)
-    
-    print(f"Interview results saved to {filename}")
-
-async def text_to_speech_file(text: str, plivo_ws):
-    tts = gTTS(text=text, lang='en', slow=False)
-    
-    tts_io = io.BytesIO()
-    tts.write_to_fp(tts_io)
-    tts_io.seek(0)
-    audio_data = tts_io.read()
-    encode = base64.b64encode(audio_data).decode('utf-8')
-
-    await plivo_ws.send(json.dumps({
-        "event": "playAudio",
-        "media": {
-            "contentType": "audio/mp3",
-            "payload": encode
+        
+        wav_buffer.seek(0)
+        
+        payload = {
+            "buffer": wav_buffer.read(),
         }
-    }))
+
+        options = PrerecordedOptions(
+            model="nova-2-conversationalai",
+            smart_format=True,
+            channels=1,
+            sample_rate=8000
+        )
+
+        response = dg_client.listen.rest.v("1").transcribe_file(payload, options)
+        
+        transcription = response.results.channels[0].alternatives[0].transcript
+        if transcription != "":
+            print("Transcription: ", transcription)
+        return transcription
+
+    except Exception as e:
+        print("Transcription error:")
+        traceback.print_exc()
+        return ""
 
 async def generate_response(input_text, plivo_ws):
-    global interview_state
+    try:
+        messages.append({"role": "user", "content": input_text})
 
-    input_text = input_text.lower().strip()
+        response = openai.ChatCompletion.create(
+            model="gpt-4o-mini",
+            messages=messages
+        )
 
-    if interview_state.stage == 'greeting':
-        if 'yes' in input_text or 'start' in input_text:
-            interview_state.interview_started = True
-            interview_state.stage = 'question'
-            await text_to_speech_file("Great! Let's start the data science interview. ", plivo_ws)
-            await ask_next_question(plivo_ws)
-        else:
-            await text_to_speech_file("I'm sorry, but this is an interview call. Would you like to proceed with the interview?", plivo_ws)
+        reply = response['choices'][0]['message']['content']
+        messages.append({"role": "assistant", "content": reply})
 
-    elif interview_state.stage == 'question':
-        if interview_state.current_question_index >= 0:
-            interview_state.answers.append(input_text)
+        print("OpenAI Response: ", reply)
+
+        # Wait for TTS to complete before allowing new input
+        await text_to_speech_file(reply, plivo_ws)
         
-        await ask_next_question(plivo_ws)
+    except Exception as e:
+        print("Response generation error:")
+        traceback.print_exc()
+        await text_to_speech_file("I'm sorry, could you repeat that?", plivo_ws)
 
-async def ask_next_question(plivo_ws):
-    global interview_state
+async def text_to_speech_file(text: str, plivo_ws):
+    try:
+        options = SpeakOptions(
+            model="aura-hera-en",
+            encoding="mulaw",
+            sample_rate=8000
+        )
 
-    interview_state.current_question_index += 1
+        audio_buffer = io.BytesIO()
 
-    if interview_state.current_question_index < len(interview_state.questions):
-        current_question = interview_state.questions[interview_state.current_question_index]
-        await text_to_speech_file(current_question, plivo_ws)
-        interview_state.stage = 'question'
-    else:
-        interview_state.interview_completed = True
-        await text_to_speech_file("Thank you for completing the data science interview. Your responses have been recorded.", plivo_ws)
-        save_interview_results(interview_state.questions, interview_state.answers)
+        response = await dg_client.speak.asyncrest.v("1").stream_raw(
+            {"text": text}, 
+            options
+        )
+        
+        async for chunk in response.aiter_bytes():
+            audio_buffer.write(chunk)
+        
+        await response.aclose()
+        audio_bytes = audio_buffer.getvalue()
+        
+        base64_audio = base64.b64encode(audio_bytes).decode('utf-8')
+        
+        await plivo_ws.send(json.dumps({
+            "event": "playAudio",
+            "media": {
+                "contentType": "audio/x-mulaw",
+                "sampleRate": 8000,
+                "payload": base64_audio
+            }
+        }))
+
+    except Exception as e:
+        print("Text-to-Speech error:")
+        traceback.print_exc()
 
 async def plivo_handler(plivo_ws):
     async def plivo_receiver(plivo_ws, sample_rate=8000, silence_threshold=0.5):
         print('Plivo receiver started')
 
-        vad = webrtcvad.Vad(1)
+        # Initialize voice activity detection (VAD) with sensitivity level
+        vad = webrtcvad.Vad(1)  # Level 1 is least sensitive
 
-        inbuffer = bytearray(b'')
-        silence_start = 0
-        chunk = None
-
-        await text_to_speech_file("Hello! Would you like to proceed with the data science interview?", plivo_ws)
+        inbuffer = bytearray(b'')  # Buffer to hold received audio chunks
+        silence_start = 0  # Track when silence begins
+        chunk = None  # Audio chunk
 
         try:
             async for message in plivo_ws:
                 try:
+                    # Decode incoming messages from the WebSocket
                     data = json.loads(message)
 
+                    # If 'media' event, process the audio chunk
                     if data['event'] == 'media':
                         media = data['media']
                         chunk = base64.b64decode(media['payload'])
                         inbuffer.extend(chunk)
 
+                    # If 'stop' event, end receiving process
                     if data['event'] == 'stop':
                         break
 
                     if chunk is None:
                         continue
 
+                    # Check if the chunk contains speech or silence
                     is_speech = vad.is_speech(chunk, sample_rate)
 
-                    if not is_speech:
-                        silence_start += 0.2
-                        if silence_start >= silence_threshold:
-                            if len(inbuffer) > 2048:
+                    if not is_speech:  # Detected silence
+                        silence_start += 0.2  # Increment silence duration (200ms steps)
+                        if silence_start >= silence_threshold:  # If silence exceeds threshold
+                            if len(inbuffer) > 2048:  # Process buffered audio if large enough
                                 transcription = await transcribe_audio(inbuffer)
                                 if transcription != '':
                                     await generate_response(transcription, plivo_ws)
-                            inbuffer = bytearray(b'')
-                            silence_start = 0
+                            inbuffer = bytearray(b'')  # Clear buffer after processing
+                            silence_start = 0  # Reset silence timer
                     else:
-                        silence_start = 0
+                        silence_start = 0  # Reset if speech is detected
                 except Exception as e:
                     print(f"Error processing message: {e}")
                     traceback.print_exc()
-        except websockets.exceptions.ConnectionClosedError:
+        except websockets.exceptions.ConnectionClosedError as e:
             print(f"Websocket connection closed")
         except Exception as e:
             print(f"Error processing message: {e}")
             traceback.print_exc()
 
+    # Start the receiver for WebSocket messages
     await plivo_receiver(plivo_ws)
 
 async def router(websocket, path):
@@ -221,14 +234,13 @@ async def router(websocket, path):
         await plivo_handler(websocket)
 
 def main():
-    print("Generated Interview Questions:")
-    for q in interview_state.questions:
-        print(f"- {q}")
-    
-    server = websockets.serve(router, 'localhost', 5000)
-
-    asyncio.get_event_loop().run_until_complete(server)
-    asyncio.get_event_loop().run_forever()
+    try:
+        server = websockets.serve(router, 'localhost', 5000)
+        asyncio.get_event_loop().run_until_complete(server)
+        asyncio.get_event_loop().run_forever()
+    except Exception as e:
+        print(f"Failed to start server: {e}")
+        sys.exit(1)
 
 if __name__ == '__main__':
     sys.exit(main() or 0)
