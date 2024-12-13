@@ -1,246 +1,237 @@
+import plivo
+from quart import Quart, websocket, Response, request
 import asyncio
-import base64
-import json
-import sys
-import traceback
-import io
-import wave
-
-import numpy as np
-import webrtcvad
 import websockets
-import openai
+import json
+import base64
+from dotenv import load_dotenv
+import os
+import requests
 
-from deepgram import (
-    DeepgramClient,
-    DeepgramClientOptions,
-    SpeakOptions,
-    PrerecordedOptions
+load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), '.env'), override=True)
+
+DEEPGRAM_API_KEY = os.getenv('DEEPGRAM_API_KEY')
+
+PORT = 5000
+SYSTEM_MESSAGE = (
+    "You are a helpful and a friendly AI assistant who loves to chat about anything the user is interested about."
 )
+with open("prompt.txt", "r") as file: 
+    prompt = file.read()
 
-def load_config(file_path='config.json'):
-    """Load configuration from a JSON file."""
-    try:
-        with open(file_path, 'r') as f:
-            return json.load(f)
-    except FileNotFoundError:
-        print(f"Config file {file_path} not found.")
-        sys.exit(1)
-    except json.JSONDecodeError:
-        print(f"Error decoding JSON from {file_path}")
-        sys.exit(1)
+app = Quart(__name__)
+stream_id = ""
 
-# Load configuration
-CONFIG = load_config()
+@app.route("/webhook", methods=["GET", "POST"])
+def home():
+    xml_data = f'''<?xml version="1.0" encoding="UTF-8"?>
+    <Response>
+        <Stream streamTimeout="86400" keepCallAlive="true" bidirectional="true" contentType="audio/x-mulaw;rate=8000" audioTrack="inbound" >
+            ws://{request.host}/media-stream
+        </Stream>
+    </Response>
+    '''
+    return Response(xml_data, mimetype='application/xml')
 
-# Initialize clients with error handling
-try:
-    dg_client = DeepgramClient(CONFIG['deepgram_api_key'])
-    dg_config = DeepgramClientOptions(api_key=CONFIG['deepgram_api_key'])
-except KeyError as e:
-    print(f"Missing configuration key: {e}")
-    sys.exit(1)
+@app.websocket('/media-stream')
+async def handle_message():
+    print('client connected')
+    plivo_ws = websocket 
+    url = "wss://agent.deepgram.com/agent"
+    headers = {
+        "Authorization": f"Token {DEEPGRAM_API_KEY}",
+    }
 
-# Set OpenAI API key
-try:
-    openai.api_key = CONFIG['openai_api_key']
-except KeyError:
-    print("OpenAI API key is missing from configuration")
-    sys.exit(1)
+    try: 
+        async with websockets.connect(url, extra_headers=headers) as deepgram_ws:
+            print('connected to the Deepgram WSS')
 
-# Interview system message
-SYSTEM_MSG = """You are an AI interviewer for HYRGPT, a platform designed to assist companies in screening and interviewing candidates. Your task is to conduct a structured telephonic interview with each candidate, which will take approximately 5 to 10 minutes to complete.
-
-Here's how you should proceed:
-
-1. Begin the interview by asking:
-   "Hello, this is Reva from Hire GPT. Do you have 10 minutes to complete the interview now?"
-
-2. Interview Questions:
-   - Please tell me more about your recent work experience.
-   - Can you describe your experience with developing mobile applications for both iOS and Android platforms?
-   - What are some best practices you follow when integrating APIs into mobile applications?
-   - How do you ensure that the mobile applications you develop are user-friendly and meet UI/UX design standards?
-   - What tools do you use for testing and optimization?
-   - Describe a situation where you faced a significant challenge during a mobile development project.
-   - Imagine you are working on a tight deadline for a mobile application launch. How would you prioritize tasks and manage your time effectively to meet the deadline?
-
-3. Interview Guidelines:
-   - Maintain a professional tone with warmth
-   - Acknowledge previous responses before asking next question
-   - If a candidate asks to skip a question, note "skipped by user"
-   - If a candidate asks to repeat a question, do so
-   - If a candidate wants to end the interview early, submit collected answers
-   - Do not provide hints for questions
-
-4. Closing: Thank the candidate and mention follow-up via email."""
-
-# Initialize messages with system context
-messages = [{"role": "system", "content": SYSTEM_MSG}]
-
-async def transcribe_audio(audio_chunk):
-    try:
-        audio_data = np.frombuffer(audio_chunk, dtype=np.uint8)
-        wav_buffer = io.BytesIO()
-        
-        with wave.open(wav_buffer, 'wb') as wav_file:
-            wav_file.setnchannels(1)
-            wav_file.setsampwidth(2)
-            wav_file.setframerate(8000)
-            wav_file.writeframes(audio_data.tobytes())
-        
-        wav_buffer.seek(0)
-        
-        payload = {
-            "buffer": wav_buffer.read(),
-        }
-
-        options = PrerecordedOptions(
-            model="nova-2-conversationalai",
-            smart_format=True,
-            channels=1,
-            sample_rate=8000
-        )
-
-        response = dg_client.listen.rest.v("1").transcribe_file(payload, options)
-        
-        transcription = response.results.channels[0].alternatives[0].transcript
-        if transcription != "":
-            print("Transcription: ", transcription)
-        return transcription
-
+            await send_Session_update(deepgram_ws)
+            
+            receive_task = asyncio.create_task(receive_from_plivo(plivo_ws, deepgram_ws))
+            
+            async for message in deepgram_ws:
+                await receive_from_deepgram(message, plivo_ws, deepgram_ws)
+            
+            await receive_task
+    
+    except asyncio.CancelledError:
+        print('client disconnected')
+    except websockets.ConnectionClosed:
+        print("Connection closed by OpenAI server")
     except Exception as e:
-        print("Transcription error:")
-        traceback.print_exc()
-        return ""
-
-async def generate_response(input_text, plivo_ws):
-    try:
-        messages.append({"role": "user", "content": input_text})
-
-        response = openai.ChatCompletion.create(
-            model="gpt-4o-mini",
-            messages=messages
-        )
-
-        reply = response['choices'][0]['message']['content']
-        messages.append({"role": "assistant", "content": reply})
-
-        print("OpenAI Response: ", reply)
-
-        # Wait for TTS to complete before allowing new input
-        await text_to_speech_file(reply, plivo_ws)
+        print(f"Error during OpenAI's websocket communication: {e}")
         
+        
+        
+            
+async def receive_from_plivo(plivo_ws, deepgram_ws):
+    print('receiving from plivo')
+    BUFFER_SIZE = 20 * 160
+    inbuffer = bytearray(b"")
+    try:
+        while True:
+            message = await plivo_ws.receive()
+            data = json.loads(message)
+            if data['event'] == 'media' and deepgram_ws.open:
+                chunk = base64.b64decode(data['media']['payload'])
+                inbuffer.extend(chunk)
+            elif data['event'] == "start":
+                print('Plivo Audio stream has started')
+                stream_id = data['start']['streamId']
+                print('stream id: ', stream_id)
+            
+            while len(inbuffer) >= BUFFER_SIZE:
+                chunk = inbuffer[:BUFFER_SIZE]
+                await deepgram_ws.send(chunk)
+                inbuffer = inbuffer[BUFFER_SIZE:]
+
+    except websockets.ConnectionClosed:
+        print('Connection closed for the plivo audio streaming servers')
+        if deepgram_ws.open:
+            await deepgram_ws.close()
     except Exception as e:
-        print("Response generation error:")
-        traceback.print_exc()
-        await text_to_speech_file("I'm sorry, could you repeat that?", plivo_ws)
-
-async def text_to_speech_file(text: str, plivo_ws):
+        print(f"Error during Plivo's websocket communication: {e}")
+        
+async def get_weather_from_city_name(city, api_key):
+    print(f'Getting weather from {api_key}')
+    # Make API call to OpenWeatherMap
+    url = f"https://api.weatherapi.com/v1/current.json?q={city}&key={api_key}"
+    
     try:
-        options = SpeakOptions(
-            model="aura-hera-en",
-            encoding="mulaw",
-            sample_rate=8000
-        )
+        response = requests.get(url)
+        data = response.json()
+        print("response: ", data)
+        
+        if response.status_code == 200:
+            return f"{data['current']['temp_c']} degree Celsius"
+        elif response.status_code == 1002:
+            return f"Cannot get the weather details for {city}"
+        elif response.status_code == 1006:
+            return f"No matching location found. Cannot get the weather details for {city}"
+        else:
+            return "Failed to fetch weather data"
+                    
+    except Exception as e:
+        print(f"Error making weather API call: {e}")
+        return "Sorry, there was an error getting the weather information"
 
-        audio_buffer = io.BytesIO()
 
-        response = await dg_client.speak.asyncrest.v("1").stream_raw(
-            {"text": text}, 
-            options
-        )
-        
-        async for chunk in response.aiter_bytes():
-            audio_buffer.write(chunk)
-        
-        await response.aclose()
-        audio_bytes = audio_buffer.getvalue()
-        
-        base64_audio = base64.b64encode(audio_bytes).decode('utf-8')
-        
-        await plivo_ws.send(json.dumps({
+async def receive_from_deepgram(message, plivo_ws, deepgram_ws):
+    try:
+        if type(message) == str:
+            response = json.loads(message)
+            print('response received from Deepgram WSS: ', response)
+            if response['type'] == 'SettingsApplied':
+                print('Settings successfully applied')
+            if response['type'] == 'Welcome':
+                print('Received welcome message')
+            elif response['type'] == 'UserStartedSpeaking':
+                clear_message = {
+                    "event": "clearAudio",
+                    "stream_id": stream_id
+                }
+                await plivo_ws.send(json.dumps(clear_message))
+            elif response['type'] == 'FunctionCallRequest':
+                if response['function_name'] == 'getWeatherFromCityName':
+                    output = await get_weather_from_city_name(response['input']['city'], os.getenv('OPENWEATHERMAP_API_KEY'))
+                    functionCallResponse = {
+                        "type": "FunctionCallResponse",
+                        "function_call_id": response['function_call_id'], 
+                        "output": output
+                    }
+                    await deepgram_ws.send(json.dumps(functionCallResponse))
+        else:
+            audioDelta = {
             "event": "playAudio",
             "media": {
-                "contentType": "audio/x-mulaw",
+                "contentType": 'audio/x-mulaw',
                 "sampleRate": 8000,
-                "payload": base64_audio
+                "payload": base64.b64encode(message).decode("ascii")
+                }
             }
-        }))
-
+            await plivo_ws.send(json.dumps(audioDelta))
     except Exception as e:
-        print("Text-to-Speech error:")
-        traceback.print_exc()
+        print(f"Error during Deepgram's websocket communication: {e}")
+    
+    
+async def send_Session_update(deepgram_ws):
+    session_update = {
+        "type": "SettingsConfiguration",
+        "audio": {
+            "input": { 
+                "encoding": "mulaw",
+                "sample_rate": 8000
+            },
+            "output": { 
+                "encoding": "mulaw",
+                "sample_rate": 8000,
+                "container": "none",
+            }
+        },
+        "agent": {
+            "listen": {
+                "model": "nova-2" 
+            },
+            "think": {
+                "provider": {   
+                    "type": "open_ai" 
+                },
+                "model": "gpt-3.5-turbo", 
+                "instructions": prompt, 
+                "functions": [
+                    {
+                        "name": "getWeatherFromCityName",
+                        "description": "Get the weather from the given city name",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "city": {
+                                    "type": "string",
+                                    "description":"The city name to get the weather from" 
+                                }
+                            },
+                            "required": ["city"]
+                        },
+                    }
+                ]
+            },
+            "speak": {
+                "model": "aura-hera-en" 
+            }
+        },
+        "context": {
+            "messages": [
+            {
+                "content": "Hello, this is Reva from Hire GPT. I have called you for a quick telephonic interview. Am I talking to Helen right now?",
+                "role": "assistant"
+            }
+            ],
+            "replay": True
+        }
+    }
+    await deepgram_ws.send(json.dumps(session_update))
 
-async def plivo_handler(plivo_ws):
-    async def plivo_receiver(plivo_ws, sample_rate=8000, silence_threshold=0.5):
-        print('Plivo receiver started')
+def function_call_output(arg, item_id, call_id):
+    sum = int(arg['num1']) + int(arg['num2'])
+    conversation_item = {
+        "type": "conversation.item.create",
+        "item": {
+            "id": item_id,
+            "type": "function_call_output",
+            "call_id": call_id,
+            "output": str(sum)
+        }
+    }
+    return conversation_item
 
-        # Initialize voice activity detection (VAD) with sensitivity level
-        vad = webrtcvad.Vad(1)  # Level 1 is least sensitive
-
-        inbuffer = bytearray(b'')  # Buffer to hold received audio chunks
-        silence_start = 0  # Track when silence begins
-        chunk = None  # Audio chunk
-
-        try:
-            async for message in plivo_ws:
-                try:
-                    # Decode incoming messages from the WebSocket
-                    data = json.loads(message)
-
-                    # If 'media' event, process the audio chunk
-                    if data['event'] == 'media':
-                        media = data['media']
-                        chunk = base64.b64decode(media['payload'])
-                        inbuffer.extend(chunk)
-
-                    # If 'stop' event, end receiving process
-                    if data['event'] == 'stop':
-                        break
-
-                    if chunk is None:
-                        continue
-
-                    # Check if the chunk contains speech or silence
-                    is_speech = vad.is_speech(chunk, sample_rate)
-
-                    if not is_speech:  # Detected silence
-                        silence_start += 0.2  # Increment silence duration (200ms steps)
-                        if silence_start >= silence_threshold:  # If silence exceeds threshold
-                            if len(inbuffer) > 2048:  # Process buffered audio if large enough
-                                transcription = await transcribe_audio(inbuffer)
-                                if transcription != '':
-                                    await generate_response(transcription, plivo_ws)
-                            inbuffer = bytearray(b'')  # Clear buffer after processing
-                            silence_start = 0  # Reset silence timer
-                    else:
-                        silence_start = 0  # Reset if speech is detected
-                except Exception as e:
-                    print(f"Error processing message: {e}")
-                    traceback.print_exc()
-        except websockets.exceptions.ConnectionClosedError as e:
-            print(f"Websocket connection closed")
-        except Exception as e:
-            print(f"Error processing message: {e}")
-            traceback.print_exc()
-
-    # Start the receiver for WebSocket messages
-    await plivo_receiver(plivo_ws)
-
-async def router(websocket, path):
-    if path == '/stream':
-        print('Plivo connection incoming')
-        await plivo_handler(websocket)
-
-def main():
-    try:
-        server = websockets.serve(router, 'localhost', 5000)
-        asyncio.get_event_loop().run_until_complete(server)
-        asyncio.get_event_loop().run_forever()
-    except Exception as e:
-        print(f"Failed to start server: {e}")
-        sys.exit(1)
-
-if __name__ == '__main__':
-    sys.exit(main() or 0)
+if __name__ == "__main__":
+    print('running the server')
+    client = plivo.RestClient(auth_id=os.getenv('PLIVO_AUTH_ID'), auth_token=os.getenv('PLIVO_AUTH_TOKEN'))
+    call_made = client.calls.create(
+        from_=os.getenv('PLIVO_FROM_NUMBER'),
+        to_=os.getenv('PLIVO_TO_NUMBER'),
+        answer_url=os.getenv('PLIVO_ANSWER_XML'),
+        answer_method='GET',)
+    app.run(port=PORT)
+    
