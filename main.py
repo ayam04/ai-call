@@ -6,7 +6,9 @@ from hypercorn.asyncio import serve
 from hypercorn.config import Config
 from server import app as quart_app, client
 from pydantic import BaseModel
+from dotenv import load_dotenv
 
+load_dotenv()
 class data(BaseModel):
     phone: int
     name: str
