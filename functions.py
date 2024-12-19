@@ -20,6 +20,10 @@ with open("prompt.txt", "r") as file:
     prompt = file.read()
 
 app = Quart(__name__)
+app.config['PROVIDE_AUTOMATIC_OPTIONS'] = True
+app.config['transcript'] = []
+app.config['transcript_filename'] = None
+
 stream_id = ""
 
 @app.route("/webhook", methods=["GET", "POST"])

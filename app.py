@@ -5,7 +5,7 @@ from hypercorn.config import Config
 from functions import app as quart_app, client
 from pydantic import BaseModel
 from conns import db_name
-from bson.objectid import ObjectId
+import bson
 from datetime import datetime
 import uvicorn
 import json
@@ -28,32 +28,32 @@ router = FastAPI()
 
 @router.post("/make-a-call")
 async def make_outbound_call(req: data):
-    screenData = screenings.find_one({"_id": ObjectId(str(req.id))})
+    screenData = screenings.find_one({"_id": bson.ObjectId(str(req.id))})
 
-    jobData = jobs.find_one({"_id": ObjectId(str(screenData['jobId']))})
+    jobData = jobs.find_one({"_id": bson.ObjectId(str(screenData['jobId']))})
     role = jobData['title']
     jd = jobData['jobDescription']
 
     questions = []
-    questionsData = jobquestions.find({'jobId':ObjectId(str(screenData['jobId']))})
+    questionsData = jobquestions.find({'jobId':bson.ObjectId(str(screenData['jobId']))})
     for i in questionsData:
         questions.append(i['question']) 
 
-    companyData = companies.find_one({"_id":ObjectId(str(jobData['companyId']))}) 
+    companyData = companies.find_one({"_id":bson.ObjectId(str(jobData['companyId']))}) 
     company = companyData['name']
     companyAbout = companyData['aboutUs']
 
     config = Config()
-    config.bind = [f"localhost:{quart_app.config.get('PORT', 5000)}"]
+    config.bind = [f"127.0.0.1:{quart_app.config.get('PORT', 5000)}"]
     quart_app.config['candidate_name'] = req.name
     quart_app.config['role'] = role
     quart_app.config['jd'] = jd
     quart_app.config['screeningId'] = req.id
     quart_app.config["company"] = company
-    print(company)
     quart_app.config['additional_info'] = f"ABout the company: {companyAbout}"
     quart_app.config["questions"] = questions
 
+    quart_app.config['PROVIDE_AUTOMATIC_OPTIONS'] = True 
     quart_app.config['transcript'] = []
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     quart_app.config['transcript_filename'] = f"transcript_{req.name}_{company}_{timestamp}.json"
@@ -61,7 +61,7 @@ async def make_outbound_call(req: data):
     client.calls.create(
         from_= NUMBER,
         to_=f"91{req.phone}",
-        answer_url="https://60c2-115-245-68-162.ngrok-free.app/webhook",
+        answer_url="https://d56e-2401-4900-5ba1-d5bb-28b1-3247-6993-2d48.ngrok-free.app/webhook",
         answer_method='GET',
     )
     
