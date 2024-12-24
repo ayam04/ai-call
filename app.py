@@ -61,7 +61,7 @@ async def make_outbound_call(req: data):
     client.calls.create(
         from_= NUMBER,
         to_=f"91{req.phone}",
-        answer_url="https://d56e-2401-4900-5ba1-d5bb-28b1-3247-6993-2d48.ngrok-free.app/webhook",
+        answer_url="https://124d-2401-4900-5b82-b83d-30ac-7ed6-ac48-9955.ngrok-free.app/webhook",
         answer_method='GET',
     )
     
