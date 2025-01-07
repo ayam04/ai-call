@@ -1,3 +1,5 @@
 config.json
 .env
 venv
+try.py
+__pycache__

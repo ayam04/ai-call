@@ -9,6 +9,7 @@ from conns import db_name
 from pydantic import BaseModel
 import bson
 from quart_cors import cors
+import requests
 
 with open('config.json') as f:
     config = json.load(f)
@@ -18,7 +19,6 @@ class data(BaseModel):
     name: str
     id: str
 
-phoneScreening = db_name['phoneScreening']
 screenings = db_name['screenings']
 jobs = db_name['jobs']
 jobquestions = db_name['jobquestions']
@@ -50,13 +50,11 @@ async def setup_cors():
 app.config['PROVIDE_AUTOMATIC_OPTIONS'] = True
 app.config['transcript'] = []
 app.config['transcript_filename'] = None
-# app.config['SERVER_NAME'] = 'phoneagent.hyrgpt.com'
-# app.config['PREFERRED_URL_SCHEME'] = 'https'
 
 stream_id = ""
 
 @app.post('/make-a-call')
-async def make_outbound_call():
+async def make_outbound_call(): 
     request_data = await request.get_json()
     req = data(**request_data)
 
@@ -90,8 +88,8 @@ async def make_outbound_call():
 
     client.calls.create(
         from_= NUMBER,
-        to_=f"91{req.phone}",
-        answer_url="https://124d-2401-4900-5b82-b83d-30ac-7ed6-ac48-9955.ngrok-free.app/webhook",
+        to_="91"+str(req.phone)[-10:],
+        answer_url="https://f018-2401-4900-5d1a-e72d-8f7-be2c-bbbc-694b.ngrok-free.app/webhook",
         answer_method='GET',
     )
     
@@ -188,9 +186,8 @@ async def receive_from_deepgram(message, plivo_ws):
             
             if response.get('type') == 'ConversationText':
                 app.config['transcript'].append({
-                    'speaker': response['role'],
-                    'text': response['content'],
-                    'timestamp': datetime.now().isoformat()
+                    'role': response['role'],
+                    'message': response['content']
                 })
             
             if response.get('type') == 'UserStartedSpeaking':
@@ -266,14 +263,18 @@ async def save_transcript():
     if app.config['transcript_filename']:
         try:
             if app.config['transcript']:
-                phoneScreening.insert_one({
-                        'candidate_name': app.config.get('candidate_name'),
-                        'role': app.config.get('role'),
-                        'company': app.config.get('company'),
-                        'screeningId': app.config.get('screeningId'),
-                        'transcript': app.config['transcript']
-                    })
-                print(f"Transcript saved to db as {app.config['transcript_filename']}")
+                screeningId = app.config.get('screeningId')
+                payload = {
+                    'screeningConversation': app.config['transcript']
+                }
+
+                url = f'https://devnodeapi.hyrgpt.com/v1/screening-status/{screeningId}'
+                response = requests.patch(url, json=payload)
+                
+                if response.status_code == 200:
+                    print(f"Transcript saved successfully for screening ID: {screeningId}")
+                else:
+                    print(f"Error saving transcript. Status code: {response.status_code}")
             else:
                 print("No transcript to save.")
         except Exception as e:
@@ -282,4 +283,4 @@ async def save_transcript():
         print("No transcript filename configured.")
 
 if __name__ == "__main__":
-    app.run(port=5000)
+    app.run(port=3010)
