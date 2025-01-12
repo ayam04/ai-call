@@ -31,6 +31,8 @@ AUTH_TOKEN = config['PLIVO_AUTH_TOKEN']
 
 client = plivo.RestClient(auth_id= AUTH_ID, auth_token= AUTH_TOKEN)
 
+active_calls = {}
+
 with open("prompt.txt", "r") as file:
     prompt = file.read()
 
@@ -50,8 +52,6 @@ async def setup_cors():
 app.config['PROVIDE_AUTOMATIC_OPTIONS'] = True
 app.config['transcript'] = []
 app.config['transcript_filename'] = None
-
-stream_id = ""
 
 @app.post('/make-a-call')
 async def make_outbound_call(): 
@@ -86,14 +86,23 @@ async def make_outbound_call():
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     app.config['transcript_filename'] = f"transcript_{req.name}_{company}_{timestamp}.json"
 
-    client.calls.create(
+    call_response = client.calls.create(
         from_= NUMBER,
         to_="91"+str(req.phone)[-10:],
-        answer_url="https://f018-2401-4900-5d1a-e72d-8f7-be2c-bbbc-694b.ngrok-free.app/webhook",
+        answer_url="https://775a-115-245-68-163.ngrok-free.app/webhook",
         answer_method='GET',
     )
+
+    app.config['current_call_uuid'] = call_response.request_uuid
+    print(f"Call initiated with UUID: {app.config['current_call_uuid']}")
     
-    return {"status": "Call initiated"}
+    active_calls[app.config['current_call_uuid']] = {
+        'stream_id': None,
+        'candidate_name': req.name,
+        'company': app.config["company"]
+    }
+    
+    return {"status": "Call initiated", "call_uuid": app.config['current_call_uuid']}
 
 @app.route("/webhook", methods=["GET", "POST"])
 def home():
@@ -160,6 +169,9 @@ async def receive_from_plivo(plivo_ws, deepgram_ws):
                 print('Plivo Audio stream has started')
                 stream_id = data['start']['streamId']
                 print('stream id: ', stream_id)
+                current_call_uuid = app.config.get('current_call_uuid')
+                if current_call_uuid and current_call_uuid in active_calls:
+                    active_calls[current_call_uuid]['stream_id'] = stream_id
             elif data['event'] == "stop":
                 print('Plivo Audio stream stopped')
                 break
@@ -190,9 +202,25 @@ async def receive_from_deepgram(message, plivo_ws):
                     'message': response['content']
                 })
             
-            if response.get('type') == 'UserStartedSpeaking':
+            elif response.get('type') == 'UserStartedSpeaking':
                 if not stream_id:
                     print("Warning: stream_id not set")
+            
+            elif response.get('type') == 'FunctionCallRequest':
+                if response['function_name'] == 'endCall':
+                    current_call_uuid = app.config.get('current_call_uuid')
+                    print(f"Received endCall request, current_call_uuid: {current_call_uuid}")
+                    # Get the current call's UUID from active_calls
+                    if current_call_uuid:
+                        result = await end_call(current_call_uuid)
+                        functionCallResponse = {
+                            "type": "FunctionCallResponse",
+                            "function_call_id": response['function_call_id'],
+                            "output": "Call ended successfully. Goodbye!" if result["status"] == "success" else f"Failed to end call: {result['message']}"
+                        }
+                        await plivo_ws.send(json.dumps(functionCallResponse))
+                    else:
+                        print("No current call UUID available")
             
             if response['type'] == 'AgentStartedSpeaking':
                 print(f"Agent speaking. Latencies - TTT: {response.get('ttt_latency', 'N/A')}, Total: {response.get('total_latency', 'N/A')}")
@@ -241,7 +269,18 @@ async def send_Session_update(deepgram_ws):
                     "type": "open_ai" 
                 },
                 "model": "gpt-4o-mini", 
-                "instructions": (prompt.format(**{"name":name, "role": role, "jd": jd, "info": info, "company": company, "questions": questions})).strip()
+                "instructions": (prompt.format(**{"name":name, "role": role, "jd": jd, "info": info, "company": company, "questions": questions})).strip(),
+                "functions": [
+                    {
+                        "name": "endCall",
+                        "description": "End the current phone call",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {},
+                            "required": []
+                        }
+                    }
+                ]
             },
             "speak": {
                 "model": "aura-hera-en" 
@@ -281,6 +320,20 @@ async def save_transcript():
             print(f"Error saving transcript: {e}")
     else:
         print("No transcript filename configured.")
+
+async def end_call(call_uuid: str):
+    """End an active Plivo call by its UUID"""
+    try:
+        print(f"Attempting to end call with UUID: {call_uuid}")
+        response = client.calls.delete(call_uuid=call_uuid)
+        print(f"Call end response: {response}")
+        if call_uuid in active_calls:
+            del active_calls[call_uuid]
+        app.config['current_call_uuid'] = None
+        return {"status": "success", "message": "Call ended successfully"}
+    except plivo.exceptions.PlivoRestError as e:
+        print(f"Error ending call: {str(e)}")
+        return {"status": "error", "message": str(e)}
 
 if __name__ == "__main__":
     app.run(port=3010)
