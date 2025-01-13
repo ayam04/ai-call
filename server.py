@@ -89,7 +89,7 @@ async def make_outbound_call():
     call_response = client.calls.create(
         from_= NUMBER,
         to_="91"+str(req.phone)[-10:],
-        answer_url="https://775a-115-245-68-163.ngrok-free.app/webhook",
+        answer_url="https://2de2-115-245-68-163.ngrok-free.app/webhook",
         answer_method='GET',
     )
 
@@ -248,54 +248,60 @@ async def send_Session_update(deepgram_ws):
     questions = app.config.get('questions')
 
     session_update = {
-        "type": "SettingsConfiguration",
-        "audio": {
-            "input": { 
-                "encoding": "mulaw",
-                "sample_rate": 8000
-            },
-            "output": { 
-                "encoding": "mulaw",
-                "sample_rate": 8000,
-                "container": "none",
-            }
+    "type": "SettingsConfiguration",
+    "audio": {
+        "input": { 
+            "encoding": "mulaw",
+            "sample_rate": 8000
         },
-        "agent": {
-            "listen": {
-                "model": "nova-2" 
-            },
-            "think": {
-                "provider": {   
-                    "type": "open_ai" 
-                },
-                "model": "gpt-4o-mini", 
-                "instructions": (prompt.format(**{"name":name, "role": role, "jd": jd, "info": info, "company": company, "questions": questions})).strip(),
-                "functions": [
-                    {
-                        "name": "endCall",
-                        "description": "End the current phone call",
-                        "parameters": {
-                            "type": "object",
-                            "properties": {},
-                            "required": []
-                        }
-                    }
-                ]
-            },
-            "speak": {
-                "model": "aura-hera-en" 
-            }
-        },
-        "context": {
-            "messages": [
-            {
-                "content": f"Hello, this is Reva from {company}. I have called you for a job interview. Am I talking to {name}?",
-                "role": "assistant"
-            }
-            ],
-            "replay": True
+        "output": { 
+            "encoding": "mulaw",
+            "sample_rate": 8000,
+            "container": "none"
         }
+    },
+    "agent": {
+        "listen": {
+            "model": "nova-2" 
+        },
+        "think": {
+            "provider": {   
+                "type": "open_ai" 
+            },
+            "model": "gpt-4o-mini",
+            "instructions": (prompt.format(**{"name":name, "role": role, "jd": jd, "info": info, "company": company, "questions": questions})).strip(),
+            "functions": [
+                {
+                    "name": "endCall",
+                    "description": "End the current phone call. Must be called using proper function calling format.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "reason": {
+                                "type": "string",
+                                "enum": ["wrong_person", "user_request", "reschedule", "interview_complete", "declined_interview"],
+                                "description": "The reason for ending the call"
+                            }
+                        },
+                        "required": ["reason"]
+                    }
+                }
+            ]
+        },
+        "speak": {
+            "model": "aura-hera-en" 
+        }
+    },
+    "context": {
+        "messages": [
+        {
+            "content": f"Hello, this is Reva from {company}. I have called you for a job interview. Am I talking to {name}?",
+            "role": "assistant"
+        }
+        ],
+        "replay": True
     }
+}
     await deepgram_ws.send(json.dumps(session_update))
 
 async def save_transcript():
@@ -321,19 +327,62 @@ async def save_transcript():
     else:
         print("No transcript filename configured.")
 
-async def end_call(call_uuid: str):
-    """End an active Plivo call by its UUID"""
+async def end_call(call_uuid: str, reason: str = None):
     try:
-        print(f"Attempting to end call with UUID: {call_uuid}")
+        # Log the call termination attempt with reason
+        print(f"Attempting to end call {call_uuid} - Reason: {reason}")
+        
+        # Validate call exists
+        if not call_uuid:
+            return {
+                "status": "error",
+                "message": "No active call UUID provided",
+                "reason": reason
+            }
+            
+        # End the call through Plivo
         response = client.calls.delete(call_uuid=call_uuid)
-        print(f"Call end response: {response}")
+        
+        # Clean up call tracking
         if call_uuid in active_calls:
+            # Store any relevant call data before deletion
+            call_data = active_calls[call_uuid]
             del active_calls[call_uuid]
+            
+            # Log call details for analytics
+            print(f"Call ended - UUID: {call_uuid}")
+            print(f"Call duration: {call_data.get('duration', 'unknown')}")
+            print(f"Termination reason: {reason}")
+            
+        # Reset current call tracking
         app.config['current_call_uuid'] = None
-        return {"status": "success", "message": "Call ended successfully"}
+        
+        return {
+            "status": "success",
+            "message": "Call ended successfully",
+            "reason": reason,
+            "plivo_response": response
+        }
+        
     except plivo.exceptions.PlivoRestError as e:
-        print(f"Error ending call: {str(e)}")
-        return {"status": "error", "message": str(e)}
+        error_msg = f"Plivo error ending call: {str(e)}"
+        print(error_msg)
+        return {
+            "status": "error",
+            "message": error_msg,
+            "reason": reason,
+            "error_details": str(e)
+        }
+        
+    except Exception as e:
+        error_msg = f"Unexpected error ending call: {str(e)}"
+        print(error_msg)
+        return {
+            "status": "error",
+            "message": error_msg,
+            "reason": reason,
+            "error_details": str(e)
+        }
 
 if __name__ == "__main__":
     app.run(port=3010)
