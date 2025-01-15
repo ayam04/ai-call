@@ -408,12 +408,9 @@ async def end_call(call_uuid: str, reason: str = None):
 
 async def reschedule_interview(screening_id: str, preferred_date: str, preferred_time: str, reason: str = None):
     try:
-        # Validate date and time format
         try:
-            # Parse the date and time to ensure they're valid
             date_obj = datetime.strptime(f"{preferred_date} {preferred_time}", "%Y-%m-%d %H:%M")
             
-            # Ensure the date is not in the past
             if date_obj < datetime.now():
                 return {
                     "status": "error",
