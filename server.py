@@ -4,7 +4,7 @@ import asyncio
 import websockets
 import json
 import base64
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from conns import db_name
 from pydantic import BaseModel
 import bson
@@ -12,6 +12,7 @@ from quart_cors import cors
 import requests
 from dataclasses import dataclass
 from typing import Dict, Optional
+import time
 
 with open('config.json') as f:
     config = json.load(f)
@@ -100,7 +101,7 @@ async def make_outbound_call():
     call_response = client.calls.create(
         from_=NUMBER,
         to_="91"+str(req.phone)[-10:],
-        answer_url=f"https://da80-115-245-68-163.ngrok-free.app/webhook/{call_id}",
+        answer_url=f"https://ed84-115-245-68-163.ngrok-free.app/webhook/{call_id}",
         answer_method='GET',
     )
     
@@ -194,58 +195,85 @@ async def receive_from_plivo(call_session: CallSession):
     except Exception as e:
         print(f"Error in Plivo communication: {e}")
 
+def check_end_call_trigger(message: str) -> bool:
+    goodbye_phrases = [
+        'goodbye',
+        # "I'll be ending the call now.",
+        'have a great day',
+        "We'll see you soon"
+        # 'end of interview', 
+        # 'interview is complete', 
+        # 'talk to you later'
+    ]
+    
+    lowercase_message = message.lower()
+    return any(phrase in lowercase_message for phrase in goodbye_phrases)
+
 async def receive_from_deepgram(message, call_session: CallSession):
     plivo_ws = call_session.websocket_connections['plivo']
+    deepgram_ws = call_session.websocket_connections['deepgram']
     
     try:
         if isinstance(message, str):
             response = json.loads(message)
+            print( response)
             
-            if response.get('type') == 'ConversationText':
+            if response['type'] == 'ConversationText':
+                current_message = response.get('content', '').strip()
+                
                 call_session.transcript.append({
                     'role': response['role'],
-                    'message': response['content']
+                    'message': current_message
                 })
+                
+                if check_end_call_trigger(current_message):
+                    result = await end_call(call_session.call_uuid, 'wrong_person')
+                    print(f"Auto-ending call due to goodbye phrase: {current_message}")
             
-            elif response.get('type') == 'FunctionCallRequest':
+            elif response['type'] == 'FunctionCallRequest':
                 if response['function_name'] == 'endCall':
-                    result = await end_call(call_session.call_uuid, response.get('parameters', {}).get('reason'))
+                    reason = response.get('input', {}).get('reason', 'NA')
+                    result = await end_call(call_session.call_uuid, reason)
+                    print(result)
                     functionCallResponse = {
                         "type": "FunctionCallResponse",
                         "function_call_id": response['function_call_id'],
                         "output": "Call ended successfully. Goodbye!" if result["status"] == "success" else f"Failed to end call: {result['message']}"
                     }
-                    await plivo_ws.send(json.dumps(functionCallResponse))
+
+                    print(functionCallResponse)
+                    await deepgram_ws.send(json.dumps(functionCallResponse))
 
                 elif response['function_name'] == 'rescheduleInterview':
-                    # Extract parameters with default values
-                    params = response.get('parameters', {})
-                    preferred_date = params.get('preferred_date') or (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
-                    preferred_time = params.get('preferred_time') or (datetime.now() + timedelta(days=1)).strftime("%H:%M")
+                    params = response.get('input', {})
+                    preferred_date = params.get('preferred_date')
+                    preferred_time = params.get('preferred_time')
                     reason = params.get('reason', 'Candidate requested reschedule')
-                    print(params)
-                    # Validate required parameters
-                    if not all([preferred_date, preferred_time]):
+
+                    if not preferred_date or not preferred_time:
                         functionCallResponse = {
                             "type": "FunctionCallResponse",
                             "function_call_id": response['function_call_id'],
-                            "output": "Missing required parameters for rescheduling"
+                            "output": "Missing required parameters for rescheduling. Please provide both date and time."
                         }
                     else:
-                        result = await reschedule_interview(
+                        result = reschedule_interview(
                             call_session.screening_id,
                             preferred_date,
                             preferred_time,
                             reason
                         )
+                        print(result)
                         functionCallResponse = {
                             "type": "FunctionCallResponse",
                             "function_call_id": response['function_call_id'],
-                            "output": result["message"]
+                            "output": result["status"]
                         }
-                    await plivo_ws.send(json.dumps(functionCallResponse))
+                    
+                    print(functionCallResponse)
+                    await deepgram_ws.send(json.dumps(functionCallResponse))
             
-            if response.get('type') == 'AgentStartedSpeaking':
+            if response["type"] == 'AgentStartedSpeaking':
                 print(f"Agent speaking for call {call_session.screening_id}")
                 
         else:
@@ -266,91 +294,91 @@ current_datetime = datetime.now().strftime("%Y-%m-%d %H:%M:%S IST")
 
 async def send_session_update(call_session: CallSession):
     deepgram_ws = call_session.websocket_connections['deepgram']
-    
+
     session_update = {
-        "type": "SettingsConfiguration",
-        "audio": {
-            "input": {
-                "encoding": "mulaw",
-                "sample_rate": 8000
-            },
-            "output": {
-                "encoding": "mulaw",
-                "sample_rate": 8000,
-                "container": "none",
-            }
-        },
-        "agent": {
-            "listen": {
-                "model": "nova-2"
-            },
-            "think": {
-                "provider": {
-                    "type": "open_ai"
+            "type": "SettingsConfiguration",
+            "audio": {
+                "input": {
+                    "encoding": "mulaw",
+                    "sample_rate": 8000
                 },
-                "model": "gpt-4o-mini",
-                "instructions": prompt.format(
-                    name=call_session.candidate_name,
-                    role=call_session.role,
-                    jd=call_session.jd,
-                    info=call_session.additional_info,
-                    company=call_session.company,
-                    questions=call_session.questions
-                ).strip(),
-                "functions": [
-                    {
-                        "name": "endCall",
-                        "description": "End the current phone call. Must be called using proper function calling format.",
-                        "parameters": {
-                            "type": "object",
-                            "properties": {
-                                "reason": {
-                                    "type": "string",
-                                    "enum": ["wrong_person", "user_request", "reschedule", "interview_complete", "declined_interview"],
-                                    "description": "The reason for ending the call"
-                                }
-                            },
-                            "required": ["reason"]
-                        }
-                    },
-                    {
-                        "name": "rescheduleInterview",
-                        "description": f"""Reschedule the interview for a new time slot. Time should be in IST. The date and time right now is: {current_datetime}""",
-                        "parameters": {
-                            "type": "object",
-                            "properties": {
-                                "preferred_date": {
-                                    "type": "string",
-                                    "description": "The preferred date in YYYY-MM-DD format"
-                                },
-                                "preferred_time": {
-                                    "type": "string",
-                                    "description": "The preferred time in 24-hour HH:mm format (IST)"
-                                },
-                                "reason": {
-                                    "type": "string",
-                                    "description": "Reason for rescheduling"
-                                }
-                            },
-                            "required": ["preferred_date", "preferred_time", "reason"]
-                        }
-                    }
-                ]
-            },
-            "speak": {
-                "model": "aura-hera-en"
-            }
-        },
-        "context": {
-            "messages": [
-                {
-                    "content": f"Hello, this is Reva from {call_session.company}. I have called you for a job interview. Am I talking to {call_session.candidate_name}?",
-                    "role": "assistant"
+                "output": {
+                    "encoding": "mulaw",
+                    "sample_rate": 8000,
+                    "container": "none",
                 }
-            ],
-            "replay": True
+            },
+            "agent": {
+                "listen": {
+                    "model": "nova-2"
+                },
+                "think": {
+                    "provider": {
+                        "type": "open_ai"
+                    },
+                    "model": "gpt-4o-mini",
+                    "instructions": prompt.format(
+                        name=call_session.candidate_name,
+                        role=call_session.role,
+                        jd=call_session.jd,
+                        info=call_session.additional_info,
+                        company=call_session.company,
+                        questions=call_session.questions
+                    ).strip(),
+                    "functions": [
+                        {
+                            "name": "endCall",
+                            "description": "End the current phone call. Must be called using proper function calling format. This function will be executed in all scenarios to ensure the call is ended appropriately.",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {
+                                    "reason": {
+                                        "type": "string",
+                                        "enum": ["wrong_person", "user_request", "reschedule", "interview_complete", "declined_interview"],
+                                        "description": "The reason for ending the call"
+                                    }
+                                },
+                                "required": ["reason"]
+                            }
+                        },
+                        {
+                            "name": "rescheduleInterview",
+                            "description": f"""Reschedule the interview for a new time slot. Time should be in IST. The date and time right now is: {current_datetime}, use this without asking the user about tomrrow's date if they ask to reschedule the call tomorrow. Also dont ask the time zone, silently take it as IST""",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {
+                                    "preferred_date": {
+                                        "type": "string",
+                                        "description": "The preferred date in YYYY-MM-DD format"
+                                    },
+                                    "preferred_time": {
+                                        "type": "string",
+                                        "description": "The preferred time in 24-hour HH:mm format (IST)"
+                                    },
+                                    "reason": {
+                                        "type": "string",
+                                        "description": "Reason for rescheduling"
+                                    }
+                                },
+                                "required": ["preferred_date", "preferred_time", "reason"]
+                            }
+                        }
+                    ]
+                },
+                "speak": {
+                    "model": "aura-hera-en"
+                }
+            },
+            "context": {
+                "messages": [
+                    {
+                        "content": f"Hello, this is Reva from {call_session.company}. I have called you for a job interview. Am I talking to {call_session.candidate_name}?",
+                        "role": "user"
+                    }
+                ],
+                "replay": True
+            }
         }
-    }
     await deepgram_ws.send(json.dumps(session_update))
 
 async def save_transcript(call_session: CallSession):
@@ -373,61 +401,79 @@ async def save_transcript(call_session: CallSession):
 async def end_call(call_uuid: str, reason: str = None):
     try:
         if not call_uuid:
+            print(f"Attempted to end call with no UUID. Reason: {reason}")
             return {
                 "status": "error",
                 "message": "No active call UUID provided",
                 "reason": reason
             }
+        
+        try:
+            response = client.calls.delete(call_uuid=call_uuid)
             
-        response = client.calls.delete(call_uuid=call_uuid)
+            print(f"Call {call_uuid} ended successfully. Reason: {reason}")
+            
+            return {
+                "status": "success",
+                "message": "Call ended successfully",
+                "reason": reason,
+                "plivo_response": response
+            }
         
-        return {
-            "status": "success",
-            "message": "Call ended successfully",
-            "reason": reason,
-            "plivo_response": response
-        }
-        
-    except plivo.exceptions.PlivoRestError as e:
-        error_msg = f"Plivo error ending call: {str(e)}"
-        print(error_msg)
-        return {
-            "status": "error",
-            "message": error_msg,
-            "error_details": str(e)
-        }
+        except plivo.exceptions.PlivoRestError as plivo_err:
+            error_msg = f"Plivo error ending call {call_uuid}: {str(plivo_err)}"
+            print(error_msg)
+            
+            return {
+                "status": "error",
+                "message": error_msg,
+                "error_details": str(plivo_err)
+            }
         
     except Exception as e:
-        error_msg = f"Unexpected error ending call: {str(e)}"
+        error_msg = f"Unexpected error ending call {call_uuid}: {str(e)}"
         print(error_msg)
+        
         return {
             "status": "error",
             "message": error_msg,
             "error_details": str(e)
         }
 
-async def reschedule_interview(screening_id: str, preferred_date: str, preferred_time: str, reason: str = None):
+def reschedule_interview(screening_id: str, preferred_date: str, preferred_time: str, reason: str = None):
     try:
         try:
-            date_obj = datetime.strptime(f"{preferred_date} {preferred_time}", "%Y-%m-%d %H:%M")
+            from dateutil.parser import parse
+            from dateutil.relativedelta import relativedelta
             
-            if date_obj < datetime.now():
+            parsed_datetime = parse(f"{preferred_date} {preferred_time}")
+            
+            ist_datetime = parsed_datetime.astimezone(timezone(timedelta(hours=5, minutes=30)))
+            
+            max_future_date = datetime.now(ist_datetime.tzinfo) + relativedelta(months=3)
+            
+            if ist_datetime < datetime.now(ist_datetime.tzinfo):
                 return {
                     "status": "error",
-                    "message": "Cannot schedule interview for a past date and time."
+                    "message": "Interview cannot be scheduled in the past."
                 }
-                
+            
+            if ist_datetime > max_future_date:
+                return {
+                    "status": "error",
+                    "message": "Interview cannot be scheduled more than 3 months in the future."
+                }
+            
+            rescheduled_datetime = ist_datetime.isoformat()
+            print(rescheduled_datetime)
+            
         except ValueError as e:
             return {
                 "status": "error",
-                "message": f"Invalid date or time format: {str(e)}. Please use YYYY-MM-DD for date and HH:mm for time."
+                "message": f"Invalid date or time format: {str(e)}. Please use a clear date and time."
             }
 
-        # Format for database storage (IST timezone)
-        rescheduled_datetime = f"{preferred_date}T{preferred_time}:00+05:30"
-
-        # Update the screening record
-        result = screenings.update_one(
+        screenings.update_one(
             {"_id": bson.ObjectId(screening_id)},
             {
                 "$set": {
@@ -439,20 +485,17 @@ async def reschedule_interview(screening_id: str, preferred_date: str, preferred
             }
         )
 
-        if result.modified_count > 0:
-            return {
-                "status": "success",
-                "message": f"Interview rescheduled successfully to {preferred_date} at {preferred_time} IST"
-            }
-        else:
-            return {
-                "status": "error",
-                "message": "Failed to update screening record"
-            }
+        print("reschedule completed")
+        
+        return {'status':"success", "message": "rescheduled call successfully!"}
 
     except Exception as e:
         error_msg = f"Error rescheduling interview: {str(e)}"
         print(error_msg)
+        
+        import traceback
+        traceback.print_exc()
+        
         return {
             "status": "error",
             "message": error_msg,
