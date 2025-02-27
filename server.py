@@ -1,3 +1,4 @@
+import bson.errors
 import plivo
 from quart import Quart, websocket, Response, request
 import asyncio
@@ -5,14 +6,13 @@ import websockets
 import json
 import base64
 from datetime import datetime, timedelta, timezone
-from conns import db_name
+from conns import *
 from pydantic import BaseModel
 import bson
 from quart_cors import cors
 import requests
 from dataclasses import dataclass
 from typing import Dict, Optional
-import time
 
 with open('config.json') as f:
     config = json.load(f)
@@ -27,6 +27,9 @@ class CallSession:
     questions: list
     screening_id: str
     transcript: list
+    skills: list
+    screening_questions: Optional[list] = None
+    knowledge_base: Optional[str] = None
     call_uuid: Optional[str] = None
     stream_id: Optional[str] = None
     websocket_connections: Dict = None
@@ -39,6 +42,11 @@ class data(BaseModel):
     phone: int
     name: str
     id: str
+    # tone: str
+
+class scoreData(BaseModel):
+    screeningId: str
+    generateScore: bool
 
 screenings = db_name['screenings']
 jobs = db_name['jobs']
@@ -70,6 +78,61 @@ async def setup_cors():
     
     app.after_request(_add_cors_headers)
 
+@app.route('/')
+async def health_check():
+    routes = []
+    for rule in app.url_map.iter_rules():
+        routes.append({
+            'endpoint': rule.endpoint,
+            'methods': list(rule.methods),
+            'path': str(rule)
+        })
+
+    ws_status = "Not tested"
+    try:
+        async with websockets.connect(
+            "wss://agent.deepgram.com/agent",
+            extra_headers={"Authorization": f"Token {DEEPGRAM_API_KEY}"}
+        ) as ws:
+            ws_status = "Connected"
+    except Exception as e:
+        ws_status = f"Error: {str(e)}"
+
+    active_calls_info = {
+        'count': len(active_calls),
+        'call_ids': list(active_calls.keys())
+    }
+
+    plivo_status = "Not tested"
+    try:
+        account_details = client.account.get()
+        plivo_status = "Connected"
+    except Exception as e:
+        plivo_status = f"Error: {str(e)}"
+
+    db_status = "Not tested"
+    try:
+        db_name.command('ping')
+        db_status = "Connected"
+    except Exception as e:
+        db_status = f"Error: {str(e)}"
+
+    status_info = {
+        'status': 'running',
+        'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S %Z'),
+        "account_details": account_details,
+        'routes': routes,
+        'connections': {
+            'deepgram_websocket': ws_status,
+            'plivo_api': plivo_status,
+            'mongodb': db_status
+        },
+        'active_calls': active_calls_info,
+        'version': '1.2.0'
+    }
+
+    return status_info
+
 @app.post('/make-a-call')
 async def make_outbound_call():
     request_data = await request.get_json()
@@ -79,9 +142,17 @@ async def make_outbound_call():
     jobData = jobs.find_one({"_id": bson.ObjectId(str(screenData['jobId']))})
     
     questions = []
-    questionsData = jobquestions.find({'jobId': bson.ObjectId(str(screenData['jobId']))})
+    squestions = []
+    questionsData = jobquestions.find({'jobId': bson.ObjectId(str(screenData['jobId'])), 'type': {"$ne":'screening'}})
     for i in questionsData:
         questions.append(i['question'])
+
+    try:
+        questions_screeningData = jobquestions.find({'jobId': bson.ObjectId(str(screenData['jobId'])), "type": "screening"})
+        for i in questions_screeningData:
+            squestions.append(i['question']) 
+    except:
+        pass
 
     companyData = companies.find_one({"_id": bson.ObjectId(str(jobData['companyId']))})
 
@@ -92,7 +163,11 @@ async def make_outbound_call():
         company=companyData['name'],
         additional_info=f"About the company: {companyData['aboutUs']}",
         questions=questions,
+        screening_questions=squestions,
         screening_id=req.id,
+        knowledge_base=jobData['knowledgeBase'],
+        skills=jobData['skill'],
+        # tone=req.tone,
         transcript=[]
     )
 
@@ -101,7 +176,7 @@ async def make_outbound_call():
     call_response = client.calls.create(
         from_=NUMBER,
         to_="91"+str(req.phone)[-10:],
-        answer_url=f"https://ed84-115-245-68-163.ngrok-free.app/webhook/{call_id}",
+        answer_url=f"{config['server']['url']}/webhook/{call_id}",
         answer_method='GET',
     )
     
@@ -119,10 +194,24 @@ async def webhook(call_id):
     if call_id not in active_calls:
         return Response("Invalid call ID", status=400)
 
+    print(f"Generating webhook response for call_id: {call_id}")
+    print(f"Request host: {request.host}")
+    
     xml_data = f'''<?xml version="1.0" encoding="UTF-8"?>
     <Response>
-        <Record recordSession="true" redirect="false" />
-        <Stream streamTimeout="86400" keepCallAlive="true" bidirectional="true" contentType="audio/x-mulaw;rate=8000" audioTrack="inbound">
+        <Record 
+            recordSession="true" 
+            redirect="false" 
+            maxLength="3600" 
+            callbackUrl="{config['server']['url']}/recording_callback?screening_id={active_calls[call_id].screening_id}"
+            callbackMethod="POST"
+        />
+        <Stream 
+            streamTimeout="86400" 
+            keepCallAlive="true" 
+            bidirectional="true" 
+            contentType="audio/x-mulaw;rate=8000" 
+            audioTrack="inbound">
             wss://{request.host}/media-stream/{call_id}
         </Stream>
     </Response>
@@ -131,41 +220,102 @@ async def webhook(call_id):
 
 @app.websocket('/media-stream/<call_id>')
 async def handle_message(call_id):
-    if call_id not in active_calls:
-        return
-
-    call_session = active_calls[call_id]
-    plivo_ws = websocket
-
-    url = "wss://agent.deepgram.com/agent"
-    headers = {"Authorization": f"Token {DEEPGRAM_API_KEY}"}
-
     try:
-        async with websockets.connect(url, extra_headers=headers) as deepgram_ws:
-            call_session.websocket_connections = {
-                'plivo': plivo_ws,
-                'deepgram': deepgram_ws
-            }
+        print(f"Websocket connection attempt for call_id: {call_id}")
+        
+        if call_id not in active_calls:
+            print(f"Call ID {call_id} not found in active_calls")
+            return
 
-            await send_session_update(call_session)
-            receive_task = asyncio.create_task(
-                receive_from_plivo(call_session)
-            )
+        call_session = active_calls[call_id]
+        plivo_ws = websocket
 
+        print(f"Active calls: {list(active_calls.keys())}")
+
+        url = "wss://agent.deepgram.com/agent"
+        headers = {"Authorization": f"Token {DEEPGRAM_API_KEY}"}
+
+        try:
+            async with websockets.connect(url, extra_headers=headers) as deepgram_ws:
+                call_session.websocket_connections = {
+                    'plivo': plivo_ws,
+                    'deepgram': deepgram_ws
+                }
+
+                await send_session_update(call_session)
+                receive_task = asyncio.create_task(
+                    receive_from_plivo(call_session)
+                )
+
+                try:
+                    async for message in deepgram_ws:
+                        await receive_from_deepgram(message, call_session)
+                except Exception as inner_e:
+                    print(f"Inner websocket error for call {call_id}: {inner_e}")
+                
+                await receive_task
+
+        except Exception as e:
+            print(f"Error in call {call_id}: {e}")
+        finally:
             try:
-                async for message in deepgram_ws:
-                    await receive_from_deepgram(message, call_session)
-            except Exception as inner_e:
-                print(f"Inner websocket error for call {call_id}: {inner_e}")
+                await save_transcript(call_session.transcript, call_session.screening_id)
+                await score_candidate(call_session.transcript, call_session.screening_id, call_session.skills)
+            except Exception as e:
+                print(f"Error during transcript saving or candidate scoring: {e}")
+            if call_id in active_calls:
+                del active_calls[call_id]
+    except Exception as e:
+        print(f"Error in websocket connection: {e}")
+        raise
+
+@app.route('/recording_callback', methods=["POST"])
+async def recording_callback():
+    try:
+        form_data = await request.form
+        recording_url = (
+            form_data.get("RecordingUrl")
+            or form_data.get("recording_url")
+            or form_data.get("RecordUrl")
+        )
+        screening_id = form_data.get("screening_id") or request.args.get("screening_id")
+        
+        if recording_url and screening_id:
+            screenings.update_one(
+                {"_id": bson.ObjectId(screening_id)},
+                {"$set": {"callRecordingURL": recording_url}}
+            )
+            print(f"Recording saved for screening_id: {screening_id}")
+        else:
+            print("Missing recording URL or screening_id in callback data.")
+    except Exception as e:
+        print(f"Error processing recording callback: {e}")
+    return Response("OK", status=200)
+
+@app.post('/phone-agent-score')
+async def phone_agent_score():
+    try:
+        req = await request.get_json()
+        req = scoreData(**req)
+        if req.generateScore:
+            recordingVal = screenings.find_one({"_id": bson.ObjectId(str(req.screeningId))}).get('callRecordingURL') or screenings.find_one({"_id": bson.ObjectId(str(req.screeningId))}).get('recording_url')
+            scoreVal = screenings.find_one({"_id": bson.ObjectId(str(req.screeningId))}).get('screeningAssessmentScore') or screenings.find_one({"_id": bson.ObjectId(str(req.screeningId))}).get('CandidateScore')
             
-            await receive_task
+            if recordingVal and scoreVal:
+                screenings.update_one(
+                    {"_id": bson.ObjectId(str(req.screeningId))},
+                    {"$set": {
+                        "callRecordingURL": recordingVal,
+                        "screeningAssessmentScore": scoreVal
+                        }},
+                )
+
+            return {"status": "success", "message": "Scores refreshed successfully"}
+        else:
+            return {"status": "error", "message": "generateScore is true"}
 
     except Exception as e:
-        print(f"Error in call {call_id}: {e}")
-    finally:
-        await save_transcript(call_session)
-        if call_id in active_calls:
-            del active_calls[call_id]
+        return {"status": "error", "message": str(e)}
 
 async def receive_from_plivo(call_session: CallSession):
     plivo_ws = call_session.websocket_connections['plivo']
@@ -199,8 +349,8 @@ def check_end_call_trigger(message: str) -> bool:
     goodbye_phrases = [
         'goodbye',
         # "I'll be ending the call now.",
-        'have a great day',
-        "We'll see you soon"
+        # 'have a great day',
+        # "We'll see you soon"
         # 'end of interview', 
         # 'interview is complete', 
         # 'talk to you later'
@@ -232,7 +382,7 @@ async def receive_from_deepgram(message, call_session: CallSession):
             
             elif response['type'] == 'FunctionCallRequest':
                 if response['function_name'] == 'endCall':
-                    reason = response.get('input', {}).get('reason', 'NA')
+                    reason = response.get('input', {})
                     result = await end_call(call_session.call_uuid, reason)
                     print(result)
                     functionCallResponse = {
@@ -310,7 +460,7 @@ async def send_session_update(call_session: CallSession):
             },
             "agent": {
                 "listen": {
-                    "model": "nova-2"
+                    "model": "nova-3"
                 },
                 "think": {
                     "provider": {
@@ -323,7 +473,10 @@ async def send_session_update(call_session: CallSession):
                         jd=call_session.jd,
                         info=call_session.additional_info,
                         company=call_session.company,
-                        questions=call_session.questions
+                        questions=call_session.questions,
+                        squestions=call_session.screening_questions,
+                        # tone= call_session.tone,
+                        knowledge_base=call_session.knowledge_base
                     ).strip(),
                     "functions": [
                         {
@@ -366,35 +519,27 @@ async def send_session_update(call_session: CallSession):
                     ]
                 },
                 "speak": {
-                    "model": "aura-hera-en"
+                    "model": "aura-asteria-en"
                 }
-            },
-            "context": {
-                "messages": [
-                    {
-                        "content": f"Hello, this is Reva from {call_session.company}. I have called you for a job interview. Am I talking to {call_session.candidate_name}?",
-                        "role": "user"
-                    }
-                ],
-                "replay": True
             }
         }
     await deepgram_ws.send(json.dumps(session_update))
 
-async def save_transcript(call_session: CallSession):
+async def save_transcript(transcript: list, screening_id: str):
     try:
-        if call_session.transcript:
+        if transcript and screening_id:
             payload = {
-                'screeningConversation': call_session.transcript
+                'screeningConversation': transcript
             }
             
-            url = f'https://devnodeapi.hyrgpt.com/v1/screening-status/{call_session.screening_id}'
+            url = f'https://devnodeapi.hyrgpt.com/v1/screening-status/{screening_id}'
             response = requests.patch(url, json=payload)
             
             if response.status_code == 200:
-                print(f"Transcript saved for screening ID: {call_session.screening_id}")
+                print(f"Transcript saved for screening ID: {screening_id}")
             else:
                 print(f"Error saving transcript. Status code: {response.status_code}")
+
     except Exception as e:
         print(f"Error saving transcript: {e}")
 
@@ -501,6 +646,54 @@ def reschedule_interview(screening_id: str, preferred_date: str, preferred_time:
             "message": error_msg,
             "error_details": str(e)
         }
+
+async def score_candidate(transcript, screening_id, skills):
+    if transcript:
+        messages = [
+            {'role': 'system', 'content': """You are a helpful Interview Reviewer. You are reviewing a candidate for a job role.
+
+            Using the transcript of an interview conversation with a candidate, generate a JSON object with the following keys and structure. The JSON must be returned on 1 SINGLE LINE (no newline characters) and contain only the JSON object (no extra explanation): 
+            
+            {"overAllSummary":"a 200-300 words summary","shortSummary":"a 100-150 words summary","strength":["strength 1 in string","strength 2 in string"],"weakness":["weakness 1 in string","weakness 2 in string"],"fitForTheRole":"Add the scoring criteria here to decide","intentWiseDistribution":[{{ skills_distribution }}],"assessmentScore":"Average of all the scores inside the intentWiseDistribution","communicationDistribution":[{{ communication_distribution }}],"communicationScore":"Average of all the scores inside the communicationDistribution","communicationSummary":"a 200-300 words summary"}
+            """},
+            {'role': 'user', 'content': f'''transcript: {transcript}'''}
+        ]
+        
+        skills_distribution = ','.join([
+            f'{{"intentName":"{skill}","score":0,"summary":"a 100 words short summary"}}' for skill in skills
+        ])
+        
+        communication_keys = ["Clarity", "Relevance", "Vocabulary", "Response Time", "Engagement"]
+        communication_distribution = ','.join([
+            f'{{"intentName":"{key}","score":0,"summary":"a 100 words short summary"}}' for key in communication_keys
+        ])
+        
+        messages[0]['content'] = messages[0]['content'].replace('{{ skills_distribution }}', skills_distribution)
+        messages[0]['content'] = messages[0]['content'].replace('{{ communication_distribution }}', communication_distribution)
+        
+        try:
+            chat = openai_client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=messages,
+                temperature=0.5,
+                top_p=1,
+                n=1,
+                stop=None
+            )
+            
+            response = json.loads(chat.choices[0].message.content)
+            if response:
+                screenings.update_one(
+                    {"_id": bson.ObjectId(screening_id)},
+                    {"$set": {"screeningAssessmentScore": response}}
+                )
+                print(f"Scores saved for screening ID: {screening_id}")
+        except json.JSONDecodeError as e:
+            print(f"JSON decoding error: {e}")
+        except bson.errors.InvalidBSON as e:
+            print(f"Invalid screening ID: {e}")
+        except Exception as e:
+            print(f"An unexpected error occurred: {e}")
 
 if __name__ == "__main__":
     app.run(port=3010)

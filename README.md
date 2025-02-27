@@ -93,3 +93,8 @@ An automated phone interview system using Plivo for telephony, Deepgram for spee
 - Plivo account
 - Deepgram account
 - Required Python packages: plivo, quart, websockets, pydantic, quart-cors
+
+## Models;
+- Speak: aura-asteria-en
+- Think: gpt-4o-mini
+- Listen: nova-3
