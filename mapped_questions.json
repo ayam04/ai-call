@@ -1,0 +1,66 @@
+    [
+    {
+        "answer": [
+            "Yes"
+        ],
+        "deleted": false,
+        "jobQuestionId": "67aff2f82cb030dbf94b963d",
+        "jobId": "67aff2e22cb030dbf94b961c",
+        "screeningId": "67d25f465108d1c3008b6368",
+        "answerGiven": {
+            "answer": "Yes.",
+            "followUpAnswer": ""
+        },
+        "createdAt": "2025-03-18T12:03:53.837402",
+        "updatedAt": "2025-03-18T12:03:53.837402",
+        "__v": 0
+    },
+    {
+        "answer": [
+            "I live in Mars."
+        ],
+        "deleted": false,
+        "jobQuestionId": "67aff3112cb030dbf94b9649",
+        "jobId": "67aff2e22cb030dbf94b961c",
+        "screeningId": "67d25f465108d1c3008b6368",
+        "answerGiven": {
+            "answer": "I live in Mars.",
+            "followUpAnswer": ""
+        },
+        "createdAt": "2025-03-18T12:03:53.837402",
+        "updatedAt": "2025-03-18T12:03:53.837402",
+        "__v": 0
+    },
+    {
+        "answer": [
+            "Car"
+        ],
+        "deleted": false,
+        "jobQuestionId": "67aff3322cb030dbf94b9650",
+        "jobId": "67aff2e22cb030dbf94b961c",
+        "screeningId": "67d25f465108d1c3008b6368",
+        "answerGiven": {
+            "answer": "I usually take, uh, auto or bike.",
+            "followUpAnswer": ""
+        },
+        "createdAt": "2025-03-18T12:03:53.837402",
+        "updatedAt": "2025-03-18T12:03:53.837402",
+        "__v": 0
+    },
+    {
+        "answer": [
+            "Chocolate"
+        ],
+        "deleted": false,
+        "jobQuestionId": "67d853507cc2c062625a313e",
+        "jobId": "67aff2e22cb030dbf94b961c",
+        "screeningId": "67d25f465108d1c3008b6368",
+        "answerGiven": {
+            "answer": "Any flavor works for me. Chocolate, vanilla, mango, pineapple.",
+            "followUpAnswer": ""
+        },
+        "createdAt": "2025-03-18T12:03:53.837402",
+        "updatedAt": "2025-03-18T12:03:53.837402",
+        "__v": 0
+    }
+]

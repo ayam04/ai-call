@@ -13,6 +13,7 @@ from quart_cors import cors
 import requests
 from dataclasses import dataclass
 from typing import Dict, Optional
+import traceback
 
 with open('config.json') as f:
     config = json.load(f)
@@ -28,6 +29,7 @@ class CallSession:
     screening_id: str
     transcript: list
     skills: list
+    all_data_questions: list
     screening_questions: Optional[list] = None
     knowledge_base: Optional[str] = None
     call_uuid: Optional[str] = None
@@ -143,14 +145,31 @@ async def make_outbound_call():
     
     questions = []
     squestions = []
+    all_data_questions = []
     questionsData = jobquestions.find({'jobId': bson.ObjectId(str(screenData['jobId'])), 'type': {"$ne":'screening'}})
     for i in questionsData:
-        questions.append(i['question'])
+        question_dict = {
+            "question": i['question']
+        }
+        if 'options' in i and i['options']:
+            question_dict["options"] = i['options']
+        else:
+            question_dict["options"] = []
+
+        if i['followUp']==True:
+            question_dict['askFollowUp'] = True
+        else:
+            pass
+        questions.append(question_dict)
+        all_data_questions.append(i)
+
+    print(f"Questions: {questions}")
 
     try:
         questions_screeningData = jobquestions.find({'jobId': bson.ObjectId(str(screenData['jobId'])), "type": "screening"})
         for i in questions_screeningData:
             squestions.append(i['question']) 
+            all_data_questions.append(i)
     except:
         pass
 
@@ -161,11 +180,12 @@ async def make_outbound_call():
         role=jobData['title'],
         jd=jobData['jobDescription'],
         company=companyData['name'],
-        additional_info=f"About the company: {companyData['aboutUs']}",
-        questions=questions,
+        additional_info = f"About the company: {companyData['aboutUs']}" if 'aboutUs' in companyData else " ",
+        questions = questions,
+        all_data_questions = all_data_questions,
         screening_questions=squestions,
         screening_id=req.id,
-        knowledge_base=jobData['knowledgeBase'],
+        knowledge_base=jobData.get('knowledgeBase'),
         skills=jobData['skill'],
         # tone=req.tone,
         transcript=[]
@@ -175,7 +195,7 @@ async def make_outbound_call():
     
     call_response = client.calls.create(
         from_=NUMBER,
-        to_="91"+str(req.phone)[-10:],
+        to_="91"+str(req.phone).replace(' ','')[-10:],
         answer_url=f"{config['server']['url']}/webhook/{call_id}",
         answer_method='GET',
     )
@@ -259,7 +279,7 @@ async def handle_message(call_id):
             print(f"Error in call {call_id}: {e}")
         finally:
             try:
-                await save_transcript(call_session.transcript, call_session.screening_id)
+                await save_transcript(call_session.transcript, call_session.screening_id, call_session.all_data_questions)
                 await score_candidate(call_session.transcript, call_session.screening_id, call_session.skills)
             except Exception as e:
                 print(f"Error during transcript saving or candidate scoring: {e}")
@@ -377,13 +397,13 @@ async def receive_from_deepgram(message, call_session: CallSession):
                 })
                 
                 if check_end_call_trigger(current_message):
-                    result = await end_call(call_session.call_uuid, 'wrong_person')
+                    result = await end_call(call_session.screening_id, call_session.call_uuid, 'callTerminated')
                     print(f"Auto-ending call due to goodbye phrase: {current_message}")
             
             elif response['type'] == 'FunctionCallRequest':
                 if response['function_name'] == 'endCall':
                     reason = response.get('input', {})
-                    result = await end_call(call_session.call_uuid, reason)
+                    result = await end_call(call_session.screening_id, call_session.call_uuid, reason)
                     print(result)
                     functionCallResponse = {
                         "type": "FunctionCallResponse",
@@ -521,29 +541,162 @@ async def send_session_update(call_session: CallSession):
                 "speak": {
                     "model": "aura-asteria-en"
                 }
-            }
+            },
+            "context": {
+                    "messages": [
+                    {
+                        "content": f"Hi {call_session.candidate_name}, I’m Rheva, an AI recruiter at {call_session.company}. We have an open position for {call_session.role}, and your profile seems like a great match! Are you open to new opportunities?",
+                        "role": "assistant"
+                    }
+                    ],
+                    "replay": True
+                }
         }
     await deepgram_ws.send(json.dumps(session_update))
 
-async def save_transcript(transcript: list, screening_id: str):
+async def save_transcript(transcript: list, screening_id: str, questions: list):
     try:
         if transcript and screening_id:
             payload = {
                 'screeningConversation': transcript
             }
-            
-            url = f'https://devnodeapi.hyrgpt.com/v1/screening-status/{screening_id}'
-            response = requests.patch(url, json=payload)
-            
+
+            url_1 = f'https://devnodeapi.hyrgpt.com/v1/screening-status/{screening_id}'
+            response = requests.patch(url_1, json=payload)
+
             if response.status_code == 200:
                 print(f"Transcript saved for screening ID: {screening_id}")
+
+                messages = [
+                    {'role': 'system', 'content': """You are a Professional Interview questions and answer mapper. You are reviewing a candidate transcript for an interview and mapping their responses with respect to the questions.
+
+                    Using the transcript of an interview conversation with a candidate, generate a JSON object with the following structure. THE JSON MUST BE RETURNED ON A SINGLE LINE with no line breaks, no extra spaces, and no explanations:
+
+                    [{"question":{"title":"question1","options":["option1","option2",..]},"answerGiven":"answer provided by user","answer":["correct option"]},{"question":{"title":"question2","options":[]},"answerGiven":"answer provided by user","answer":[]}, ...]
+
+                    Do not include any markdown formatting, explanation, or additional text. Return ONLY the JSON IN A SINGLE LINE.
+
+                    If the candidate did not answer a question, leave the "answerGiven" field empty. If the question was multiple choice, provide the correct answer in the "answer" field. If the question was open-ended, use the user answer in the "answer" field.
+
+                    Maps everything correctly closest to the questions asked and the answer provided by the candidate.
+
+                    If a candidate has multiple words in their answer, you can use one of them in the answers field.
+
+                    Always map the answer given by the user to the options given in the question (if any) and remember to MAP ONLY 1 OPTION.
+
+                    ALWAYS RETURN A SINGLE LINE JSON OBJECT WITHOUT ANY EXTRA TEXT OR EXPLANATION.
+                    """},
+                    {'role': 'user', 'content': f'''transcript: {transcript} and questions: {questions}'''}
+                ]
+
+                chat = openai_client.chat.completions.create(
+                    model="o3-mini-2025-01-31",
+                    messages=messages,
+                    top_p=1,
+                    n=1,
+                    stop=None
+                )
+
+                response_content = chat.choices[0].message.content.strip()
+                
+                try:
+                    m_response = json.loads(response_content)
+                except json.JSONDecodeError:
+                    print("Initial JSON parsing failed, attempting to extract valid JSON...")
+                    
+                    try:
+                        start_idx = response_content.find('[')
+                        end_idx = response_content.rfind(']') + 1
+                        
+                        if start_idx != -1 and end_idx != -1 and start_idx < end_idx:
+                            json_content = response_content[start_idx:end_idx]
+                            m_response = json.loads(json_content)
+                        else:
+                            raise ValueError("Could not find JSON array markers in response")
+                    except Exception as json_error:
+                        print(f"JSON extraction failed: {str(json_error)}")
+                        print(f"Response content: {response_content}")
+                        m_response = []
+                        for q in questions:
+                            m_response.append({
+                                "question": {"title": q["question"], "options": [opt["value"] for opt in q.get("options", [])]},
+                                "answerGiven": "",
+                                "answer": []
+                            })
+                
+                mapped_questions = []
+                
+                for question_data in questions:
+                    try:
+                        mapped_answer = next(
+                            (item for item in m_response 
+                            if "question" in item 
+                            and "title" in item["question"] 
+                            and item["question"]["title"].strip().lower() == question_data["question"].strip().lower()), 
+                            None
+                        )
+                        
+                        if not mapped_answer:
+                            print(f"Warning: No matching answer found for question: {question_data['question']}")
+                            mapped_answer = {
+                                "question": {"title": question_data["question"]},
+                                "answerGiven": "",
+                                "answer": []
+                            }
+                        
+                        answers = []
+                        if question_data["questionType"] in ["Dropdown", "Radio"]:
+                            correct_option = next((opt["value"] for opt in question_data.get("options", []) if opt.get("correctAns", False)), None)
+                            if correct_option:
+                                answers = [correct_option]
+                            elif mapped_answer.get("answer"):
+                                answer_data = mapped_answer["answer"]
+                                answers = answer_data if isinstance(answer_data, list) else [answer_data]
+                        elif question_data["questionType"] == "Checkbox":
+                            if mapped_answer.get("answer"):
+                                answer_data = mapped_answer["answer"]
+                                answers = answer_data if isinstance(answer_data, list) else [answer_data]
+                        else:
+                            if mapped_answer.get("answerGiven"):
+                                answers = [mapped_answer["answerGiven"]]
+                     
+                        question_response = {
+                            "answer": answers,
+                            "deleted": False,
+                            "jobQuestionId": str(question_data["_id"]),
+                            "jobId": str(question_data["jobId"]),
+                            "screeningId": str(screening_id),
+                            "answerGiven": {
+                                "answer": mapped_answer.get("answerGiven", ""),
+                                "followUpAnswer": ""
+                            },
+                            "createdAt": datetime.utcnow().isoformat(),
+                            "updatedAt": datetime.utcnow().isoformat(),
+                            "__v": 0
+                        }
+                        
+                        mapped_questions.append(question_response)
+                    except Exception as mapping_error:
+                        print(f"Error mapping question {question_data['question']}: {str(mapping_error)}")
+                
+                if mapped_questions:
+                    url_2 = f'https://devnodeapi.hyrgpt.com/v1/job-answer-user/'
+                    response = requests.post(url_2, json=mapped_questions)
+                    if response.status_code == 201:
+                        print(f"Questions mapped for screening ID: {screening_id}")
+                    else:
+                        print(f"Error mapping questions. Status code: {response.status_code}")
+                        print(f"Response: {response.text}")
+                else:
+                    print("No questions were successfully mapped. Skipping API call.")
             else:
                 print(f"Error saving transcript. Status code: {response.status_code}")
-
+                
     except Exception as e:
-        print(f"Error saving transcript: {e}")
+        print(f"Error in save_transcript: {str(e)}")
+        traceback.print_exc()
 
-async def end_call(call_uuid: str, reason: str = None):
+async def end_call(screening_id: str, call_uuid: str, reason: str = None):
     try:
         if not call_uuid:
             print(f"Attempted to end call with no UUID. Reason: {reason}")
@@ -557,7 +710,12 @@ async def end_call(call_uuid: str, reason: str = None):
             response = client.calls.delete(call_uuid=call_uuid)
             
             print(f"Call {call_uuid} ended successfully. Reason: {reason}")
-            
+            screenings.update_one(
+                {"_id": bson.ObjectId(screening_id)},
+                {"$set": {
+                    "candidateStatus": reason or "complete"
+                }}
+            )
             return {
                 "status": "success",
                 "message": "Call ended successfully",
@@ -685,7 +843,11 @@ async def score_candidate(transcript, screening_id, skills):
             if response:
                 screenings.update_one(
                     {"_id": bson.ObjectId(screening_id)},
-                    {"$set": {"screeningAssessmentScore": response}}
+                    {"$set": {
+                        "screeningAssessmentScore": response,
+                        "candidateStatus" : "screened",
+                        "isSubmitted" : True
+                        }},
                 )
                 print(f"Scores saved for screening ID: {screening_id}")
         except json.JSONDecodeError as e:
